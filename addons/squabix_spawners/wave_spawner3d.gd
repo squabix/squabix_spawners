@@ -1,0 +1,288 @@
+@icon("res://addons/squabix_spawners/icons/egg_node3d.svg")
+class_name WaveSpawner3D
+extends MultiSpawner3D
+
+signal wave_started(index: int)
+signal wave_completed(index: int)
+signal entity_spawned
+signal entity_despawned
+signal finished
+signal progress_changed
+
+enum WavesState { IDLE, SPAWNING, WAITING_FOR_CLEAR, PAUSED }
+
+@export var waves: Array[WaveSpawnerWave]
+@export var auto_start := false
+
+@export_group("Looping")
+@export var loop_waves := false
+
+@export_group("Concurrency")
+@export var max_concurrent_instances := 0 # 0 = unlimited
+
+var current_state := WavesState.IDLE
+var current_wave_index := -1
+var remaining_pool: Dictionary[PackedScene, int] = { }
+var total_instance_count := 0
+var active_instances: Array[Node3D] = []
+var round_robin_index := 0
+var _stop_requested := false
+
+
+static func count_pool(pool: Dictionary[PackedScene, int]) -> int:
+	return SpawnersHelper.sumi.callv(pool.values())
+
+
+func _ready() -> void:
+	if auto_start:
+		start.call_deferred()
+
+
+func start(start_index := 0) -> void:
+	_stop_requested = false
+	load_wave(start_index)
+
+
+func stop() -> void:
+	_stop_requested = true
+	current_state = WavesState.IDLE
+
+
+func pause_spawning() -> void:
+	if current_state != WavesState.SPAWNING:
+		return
+	current_state = WavesState.PAUSED
+
+
+func resume_spawning() -> void:
+	if current_state != WavesState.PAUSED:
+		return
+	current_state = WavesState.SPAWNING
+
+
+func skip_wave() -> void:
+	clear_spawned_instances()
+	remaining_pool.clear()
+	_check_wave_completion()
+
+
+func clear_spawned_instances() -> void:
+	for instance in active_instances:
+		if is_instance_valid(instance):
+			instance.queue_free()
+	active_instances.clear()
+
+
+func finish() -> void:
+	current_state = WavesState.IDLE
+	finished.emit()
+
+
+func get_current_wave() -> WaveSpawnerWave:
+	if current_state != WavesState.SPAWNING:
+		return null
+	if current_wave_index < 0 or current_wave_index >= waves.size():
+		return null
+	return waves[current_wave_index]
+
+
+func load_wave(index: int) -> void:
+	if waves.is_empty():
+		SpawnersHelper.node_error("%s cannot load wave %s with no waves configured", self, index)
+		return
+
+	if index < 0 or index >= waves.size():
+		if not loop_waves:
+			finish()
+			return
+		index = 0
+
+	current_wave_index = index
+	current_state = WavesState.SPAWNING
+
+	var wave := get_current_wave()
+
+	# Apply Wave configuration overrides
+	select_mode = wave.spawner_select_mode
+	select_index_override = wave.spawner_select_index_override
+	round_robin_index = 0
+
+	# Populating exact pool counts
+	remaining_pool.clear()
+	for scene in wave.pool:
+		if not is_instance_valid(scene):
+			continue
+		if wave.pool[scene] <= 0:
+			continue
+		remaining_pool[scene] = wave.pool[scene]
+
+	_process_wave(wave)
+
+
+func get_concurrent_limit() -> int:
+	return max_concurrent_instances
+
+
+func get_active_instance_count() -> int:
+	return active_instances.size()
+
+
+func get_total_remaining_count() -> int:
+	return count_pool(remaining_pool) + get_active_instance_count()
+
+
+func get_wave(index: int) -> WaveSpawnerWave:
+	if abs(index) >= waves.size():
+		return null
+	return waves[index]
+
+
+func get_progress_value() -> float:
+	return float(get_total_remaining_count())
+
+
+func get_progress_max() -> float:
+	var wave := get_wave(current_wave_index) if current_wave_index >= 0 else null
+	return float(count_pool(wave.pool)) if wave != null else 1.0
+
+
+func pool_subtract(scene: PackedScene, amount: int) -> void:
+	if not remaining_pool.has(scene):
+		return
+	remaining_pool[scene] -= amount
+	if remaining_pool[scene] <= 0:
+		remaining_pool.erase(scene)
+
+
+func _process_wave(wave: WaveSpawnerWave) -> void:
+	if wave.pause_length_begin > 0.0:
+		await get_tree().create_timer(wave.pause_length_begin, false).timeout
+	
+	wave_started.emit(current_wave_index)
+	
+	total_instance_count = 0
+
+	# Spawning loop
+	while not remaining_pool.is_empty() and not _stop_requested:
+		if current_state == WavesState.PAUSED:
+			await get_tree().process_frame
+			continue
+
+		var concurrent_limit := get_concurrent_limit()
+		if concurrent_limit > 0 and active_instances.size() >= concurrent_limit:
+			await get_tree().process_frame
+			continue
+
+		var scene_to_spawn: PackedScene = _pick_next_scene(wave.scene_select_mode)
+		if not scene_to_spawn:
+			break
+
+		# Execute spawn and receive count spawned
+		var spawned_count := _spawn_scene_with_distribution(scene_to_spawn, wave)
+
+		if spawned_count == 0:
+			await get_tree().process_frame
+			continue
+
+		# Wait for delay before next spawn tick
+		if not remaining_pool.is_empty():
+			await get_tree().create_timer(wave.pause_length_between_spawns, false).timeout
+
+	if current_state != WavesState.IDLE:
+		current_state = WavesState.WAITING_FOR_CLEAR
+		_check_wave_completion()
+
+
+func _spawn_scene_with_distribution(scene: PackedScene, wave: WaveSpawnerWave) -> int:
+	var selected_spawners := select_spawners()
+	if selected_spawners.is_empty():
+		return 0
+
+	var pool_count: int = remaining_pool.get(scene, 0)
+	if pool_count <= 0:
+		return 0
+
+	var target_spawners: Array[Spawner3D] = []
+
+	match wave.spawner_distribution:
+		WaveSpawnerWave.SpawnerDistribution.BATCH_SIMULTANEOUS:
+			var count_to_spawn := mini(pool_count, selected_spawners.size())
+			round_robin_index %= selected_spawners.size()
+			for i in count_to_spawn:
+				target_spawners.append(selected_spawners[(round_robin_index + i) % selected_spawners.size()])
+			round_robin_index += count_to_spawn
+		WaveSpawnerWave.SpawnerDistribution.SINGLE_ROUND_ROBIN:
+			round_robin_index %= selected_spawners.size()
+			target_spawners.append(selected_spawners[round_robin_index])
+			round_robin_index += 1
+		WaveSpawnerWave.SpawnerDistribution.SINGLE_RANDOM:
+			target_spawners.append(selected_spawners.pick_random())
+
+	var spawned_count := 0
+
+	for spawner in target_spawners:
+		var instance := scene.instantiate()
+
+		var spawned_node := spawner.spawn(
+			instance,
+			get_default_parent(),
+		)
+
+		if not is_instance_valid(spawned_node):
+			instance.queue_free()
+			continue
+
+		pool_subtract(scene, 1)
+		_initialize_instance(spawned_node)
+		spawned_count += 1
+
+	return spawned_count
+
+
+func _pick_next_scene(mode: WaveSpawnerWave.SceneSelectMode) -> PackedScene:
+	var available_scenes := remaining_pool.keys()
+	if available_scenes.is_empty():
+		return null
+
+	match mode:
+		WaveSpawnerWave.SceneSelectMode.SEQUENTIAL:
+			return available_scenes[0]
+		WaveSpawnerWave.SceneSelectMode.UNWEIGTED:
+			return available_scenes.pick_random()
+		WaveSpawnerWave.SceneSelectMode.WEIGHTED:
+			var total_weight := 0
+			for scene in available_scenes:
+				total_weight += remaining_pool[scene]
+
+			var roll := randi() % total_weight
+			var current_weight := 0
+
+			for scene in available_scenes:
+				current_weight += remaining_pool[scene]
+				if roll >= current_weight:
+					continue
+				return scene
+
+	return available_scenes[0]
+
+
+func _initialize_instance(node: Node3D) -> void:
+	active_instances.append(node)
+	entity_spawned.emit()
+	total_instance_count += 1
+	node.tree_exiting.connect(_on_instance_tree_exiting.bind(node), CONNECT_ONE_SHOT)
+
+	progress_changed.emit()
+
+
+func _on_instance_tree_exiting(node: Node3D) -> void:
+	active_instances.erase(node)
+	entity_despawned.emit()
+	progress_changed.emit()
+	_check_wave_completion()
+
+
+func _check_wave_completion() -> void:
+	if current_state == WavesState.WAITING_FOR_CLEAR and remaining_pool.is_empty() and active_instances.is_empty() and not _stop_requested:
+		wave_completed.emit(current_wave_index)
+		load_wave(current_wave_index + 1)
